@@ -1,0 +1,219 @@
+'use strict';
+
+const HQ_PORTAL=location.pathname.replace(/\/$/,'')==='/hq';
+const PORTAL_HEADERS={'X-Portal':HQ_PORTAL?'hq':'store'};
+const AUTH_VALID_MS=5000, RECOGNIZE_INTERVAL_MS=4000;
+
+const $=s=>document.querySelector(s), esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+const fmt=s=>{s=Number(s||0);let sign=s<0?'-':'';s=Math.abs(s);return `${sign}${Math.floor(s/3600)}時間${Math.floor(s%3600/60)}分${Math.floor(s%60)}秒`};
+
+const local=t=>t?new Date(t).toLocaleString('ja-JP',{hour12:false}):'―';
+
+const iso=v=>v?new Date(v).toISOString():null;
+
+const dateInput=t=>{let d=new Date(t||Date.now());return new Date(d-d.getTimezoneOffset()*60000).toISOString().slice(0,19)};
+
+let me=null,D=null,P=null,route='home',stream=null,cameraTimer=null,clockTimer=null,face=null,faceAt=0,recognizing=false,recognitionTask=null,punching=false,noticeTimer=null,currentReceipt=null,unresolved=localStorage.getItem('attendance-unresolved'),activityAt=0,renderSerial=0;
+
+const dialog=$('#dialog');let enrollmentPhotos={},enrollmentStreams=[];
+
+function toast(t){$('#toast').textContent=t;$('#toast').style.display='block';clearTimeout(toast.timer);toast.timer=setTimeout(()=>$('#toast').style.display='none',6500)}
+
+async function api(path,body){let r=await fetch('/api/'+path,{method:body===undefined?'GET':'POST',headers:body===undefined?PORTAL_HEADERS:{...PORTAL_HEADERS,'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body)});let data=await r.json();if(!r.ok){let e=new Error(data.error||'処理できませんでした。');e.status=r.status;throw e}return data}
+
+function btn(text,action,cls='',attrs=''){return `<button type="button" class="${cls}" data-action="${action}" ${attrs}>${esc(text)}</button>`}
+
+function storeName(id){if(id===0)return '全店舗';return D?.stores.find(s=>s.id==id)?.name||P?.stores.find(s=>s.id==id)?.name||id}
+
+function tag(v){return `<span class="tag ${String(v).includes('確認')||v==='差し戻し'?'warn':''}">${esc(v)}</span>`}
+
+function table(headers,rows){return rows.length?`<div class="table-scroll"><table><thead><tr>${headers.map(x=>`<th>${esc(x)}</th>`).join('')}</tr></thead><tbody>${rows.join('')}</tbody></table></div>`:'<div class="panel empty">該当する記録はありません。</div>'}
+
+function page(title,subtitle='',actions=''){return `<div class="page-head"><div><h1>${title}</h1><span class="muted">${subtitle}</span></div><div class="actions">${actions}</div></div>`}
+
+function modal(title,html){$('#dialog-content').innerHTML=`<div class="page-head"><h2>${esc(title)}</h2>${btn('閉じる','close')}</div>${html}`;if(!dialog.open)dialog.showModal()}
+
+function fail(e){toast(e.message||String(e));console.error('処理失敗:', e.status||'network');}
+
+const sections={home:['ホーム',[['home','ホーム']]],approval:['申請承認',[['approval/correction','勤怠修正・取り消し'],['approval/register','従業員登録・再開'],['approval/photo','写真更新'],['approval/stop','利用停止'],['approval/transfer','店舗異動'],['approval/help','応援勤務']]],attendance:['勤怠管理',[['attendance','勤務記録一覧']]],monthly:['月次集計',[['monthly','月次一覧・CSV出力'],['carry','繰越調整'],['annual','年度完了']]],notices:['業務連絡',[['notices','連絡一覧'],['notice-new','新規投稿']]],people:['店舗・従業員情報',[['people','従業員一覧'],['stores','店舗一覧'],['helpers','応援勤務一覧']]],settings:['設定・保守',[['settings','自分の設定・パスワード'],['users','アカウント管理'],['store-password','共通パスワード'],['backups','バックアップ・復元'],['system','システム設定']]],employees:['従業員関連',[['employee/register','新規登録'],['employee/photo','写真更新'],['employee/rehire','利用再開'],['employee/stop','利用停止'],['employee/transfer','店舗異動'],['employee/help','応援勤務']]],requests:['申請一覧',[['requests','申請一覧']]]};
+
+function header(){let terminal=me?.role==='terminal';$('#header').innerHTML=`<div class="brand">${terminal?esc(storeName(me.store_id)):'勤怠管理システム'}</div><div class="header-actions">${terminal?'<span id="connection">接続確認中</span>'+btn('管理者','manager-login'):me?`<span>${esc(me.user.name)}　${me.role==='manager'?'店舗責任者管理':'本社管理'}</span>${btn('メニュー','menu-toggle','menu-mobile')}${btn('ログアウト','logout')}`:''}</div>`;
+
+let keys=!me||terminal?[]:me.role==='manager'?['home','attendance','employees','requests','notices']:['home','approval','attendance','monthly','notices','people','settings'];$('#navigation').innerHTML=keys.map(k=>`<button type="button" data-category="${k}">${esc(me.role==='manager'&&k==='attendance'?'勤怠確認':sections[k][0])}${k==='home'?'':' ⌄'}</button>`).join('');}
+
+async function boot(){stopCamera();clearTimeout(noticeTimer);P=await api('public');try{me=await api('me')}catch{me=null}header();if(!me){login();return}if(me.user?.must_change){passwordPage(true);return}if(me.role==='terminal'){clock();return}D=await api('data');await render(location.hash.slice(1)||'home')}
+
+function login(mode=HQ_PORTAL?'hq':'store'){route='login';let chosen=Number(sessionStorage.getItem('store-choice')||0);$('#main').innerHTML=`<section class="panel narrow"><h1>${mode==='store'?'店舗端末へログイン':mode==='manager'?'店舗責任者ログイン':'本社ログイン'}</h1>${!P.initialized?'<p class="notice error">初期設定が必要です。サーバーで python manage.py init --demo を実行してください。</p>':''}<form id="login-form" data-mode="${mode}">${mode==='store'?`<label>店舗を選択</label><div class="actions">${P.stores.map(s=>btn(s.name,'choose-store',s.id===chosen?'primary':'',`data-id="${s.id}"`)).join('')}</div><input type="hidden" name="store_id" value="${chosen||''}"><label>選択した店舗名を入力</label><input name="store_name" autocomplete="off" required placeholder="店舗名をもう一度入力">`:'<label>従業員ID（9桁）</label><input name="username" inputmode="numeric" pattern="[0-9]{9}" maxlength="9" autocomplete="username" required>'}<label>パスワード</label><input name="password" type="password" autocomplete="current-password" required><div class="actions" style="margin-top:24px"><button class="primary" type="submit">ログイン</button>${mode==='manager'?btn('打刻画面に戻る','clock'):''}</div></form></section>`;}
+
+function stopCamera(){enrollmentStreams.forEach(s=>s.getTracks().forEach(t=>t.stop()));enrollmentStreams=[];clearTimeout(cameraTimer);clearInterval(clockTimer);if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}face=null;recognizing=false}
+
+async function clock(){stopCamera();route='clock';header();$('#main').innerHTML=`<div class="clock-time" id="time"></div><div class="clock-date" id="date"></div><div class="clock-layout"><div class="camera"><video id="video" autoplay muted playsinline></video><div id="face-box"></div><div id="camera-msg" class="camera-msg">カメラを起動しています。</div></div><section class="person"><h1 id="person-name">カメラの前にお立ちください</h1><p id="person-state" class="muted">本人認証とライブネスを確認します</p><div id="punch-actions" class="clock-actions"></div><p class="muted">ボタンを押すと本人確認して打刻します</p><p id="clock-error" class="notice error hidden"></p></section></div>`;clockTimer=setInterval(updateClock,100);updateClock();updateFace();if(unresolved){punching=true;$('#camera-msg').textContent='前回の打刻結果を確認しています。';recover();return}try{if(!navigator.mediaDevices?.getUserMedia)throw new Error('カメラ利用にはHTTPSが必要です。Tailscale ServeのURLで開いてください。');stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:960},height:{ideal:720}},audio:false});$('#video').srcObject=stream;await $('#video').play();cameraLoop()}catch(e){$('#camera-msg').textContent='カメラを起動できません。';$('#clock-error').classList.remove('hidden');$('#clock-error').textContent=e.message}}
+
+function updateClock(){if(!$('#time'))return;$('#time').textContent=new Date().toLocaleTimeString('ja-JP',{hour12:false});$('#date').textContent=new Date().toLocaleDateString('ja-JP',{year:'numeric',month:'long',day:'numeric',weekday:'long'});if(face&&Date.now()-faceAt>AUTH_VALID_MS){face=null;updateFace()}}
+
+function capture(){let v=$('#video');if(!v?.videoWidth)throw new Error('カメラ画像を取得できません。');let c=document.createElement('canvas'),scale=Math.min(1,960/v.videoWidth);c.width=Math.round(v.videoWidth*scale);c.height=Math.round(v.videoHeight*scale);c.getContext('2d').drawImage(v,0,0,c.width,c.height);return c.toDataURL('image/jpeg',.85)}
+
+async function cameraLoop(){
+    if(route!=='clock'||!stream)return;
+    const started=Date.now(), activeStream=stream;
+    try{
+        if(punching||recognizing)return;
+        recognizing=true;
+        recognitionTask=api('recognize',{image:capture()});
+        let result=await recognitionTask;
+        if(route!=='clock'||stream!==activeStream||punching)return;
+        // The operation window starts when the result arrives, not before inference.
+        face=result.authenticated?result:null;
+        faceAt=Date.now();
+        $('#camera-msg').textContent=result.message;
+        $('#connection').textContent='● 接続中';
+        updateFace();
+    }catch(e){
+        if(route==='clock'&&stream===activeStream&&!punching){
+            face=null;
+            if($('#connection'))$('#connection').textContent='通信・認証エラー';
+            if($('#camera-msg'))$('#camera-msg').textContent=e.message;
+            updateFace();
+        }
+    }finally{
+        recognizing=false;recognitionTask=null;
+        // Count inference time in the four-second interval. Keep the previous
+        // successful result active while its replacement is being processed.
+        if(route==='clock'&&stream===activeStream){
+            cameraTimer=setTimeout(cameraLoop,punching?250:Math.max(0,RECOGNIZE_INTERVAL_MS-(Date.now()-started)));
+        }
+    }
+}
+
+function updateFace(){if(!$('#person-name'))return;$('#person-name').textContent=face?face.name:'カメラの前にお立ちください';$('#person-state').textContent=punching?'本人確認・記録中です':face?face.state:'ボタンを押すと本人確認します';let actions=face?(face.state==='勤務中'?['休憩開始','退勤']:face.state==='休憩中'?['休憩終了']:['出勤']):['出勤','退勤','休憩開始','休憩終了'];$('#punch-actions').innerHTML=actions.map((a,i)=>`<button type="button" data-punch="${a}" class="${i?'navy':'primary'}" ${punching?'disabled':''}>${a}</button>`).join('');let box=$('#face-box');if(box){box.style.display=face?.box?'block':'none';if(face?.box){let [x1,y1,x2,y2]=face.box;box.style.left=(100-x2/face.width*100)+'%';box.style.top=(y1/face.height*100)+'%';box.style.width=((x2-x1)/face.width*100)+'%';box.style.height=((y2-y1)/face.height*100)+'%'}}}
+
+async function doPunch(action){
+    if(punching||route!=='clock'||!stream)return;
+    punching=true;updateFace();
+    // A click is an intent, never permission to record without authentication.
+    try{
+        if(recognitionTask)await recognitionTask.catch(()=>{});
+        let verified=face&&Date.now()-faceAt<=AUTH_VALID_MS?face:null;
+        if(!verified){
+            if(route!=='clock'||!stream){punching=false;return}
+            $('#camera-msg').textContent='打刻のため本人確認しています。カメラを見てください。';
+            verified=await api('recognize',{image:capture()});
+            if(!verified.authenticated)throw new Error(verified.message||'本人確認できませんでした。');
+        }
+        if(route!=='clock'||!stream){punching=false;return}
+        // Capture again after identification: the server verifies this fresh frame
+        // and requires the identity to match the short-lived ticket.
+        let image=capture(),timestamp=new Date().toISOString(),id=crypto.randomUUID();
+        let body={request_id:id,action,timestamp,image,ticket:verified.ticket};
+        face=null;updateFace();unresolved=id;localStorage.setItem('attendance-unresolved',id);
+        try{
+            let result=await api('punch',body);
+            unresolved=null;localStorage.removeItem('attendance-unresolved');await complete(result);
+        }catch(e){
+            if(e.status&&e.status<500){unresolved=null;localStorage.removeItem('attendance-unresolved');throw e}
+            toast('結果を確認しています。もう一度打刻しないでください。');recover();
+        }
+    }catch(e){
+        punching=false;face=null;updateFace();toast(e.message);
+    }
+}
+
+async function recover(){if(!unresolved)return;try{let result=await api('result/'+unresolved);if(!result.pending){unresolved=null;localStorage.removeItem('attendance-unresolved');if(result.not_saved){punching=false;toast(result.message);await clock()}else await complete(result);return}if($('#camera-msg'))$('#camera-msg').textContent=`打刻結果を確認中です。店舗責任者へ報告してください。要求ID: ${unresolved}`;}catch(e){if($('#clock-error')){$('#clock-error').classList.remove('hidden');$('#clock-error').textContent=e.message}}cameraTimer=setTimeout(recover,2500)}
+
+async function complete(result){stopCamera();punching=false;currentReceipt=result;route='complete';$('#main').innerHTML=`<section class="completion"><div class="check">✓</div><h1>${esc(result.action)}を記録しました</h1><h2>${esc(result.name)}さん</h2><p>${esc(local(result.timestamp))}</p></section>`;setTimeout(()=>{if(result.notices?.length)showNotice(0);else clock()},3000)}
+
+function showNotice(i){route='notice';let n=currentReceipt.notices[i];$('#main').innerHTML=`<section class="panel narrow"><small>業務連絡 ${i+1}/${currentReceipt.notices.length}</small><h1>${esc(n.title)}</h1><div class="message-body">${esc(n.body)}</div>${btn('確認しました','ack','primary',`data-index="${i}" data-id="${n.id}"`)}<p class="muted">30秒間操作がない場合、未確認のまま待機画面へ戻ります。</p></section>`;clearTimeout(noticeTimer);noticeTimer=setTimeout(clock,30000)}
+
+function navTo(path){location.hash=path;render(path).catch(fail)}
+
+async function render(path='home'){if(!me||me.role==='terminal')return;stopCamera();route=path;let serial=++renderSerial;D=await api('data');if(serial!==renderSerial)return;header();$('#navigation').classList.remove('open');let m=$('#main');if(path==='home'){let issues=D.shifts.filter(s=>s.issue),pending=D.requests.filter(r=>r.status==='申請中'),last=D.backups[0];m.innerHTML=page('ホーム',me.role==='manager'?'担当店舗の勤務状況と申請結果':'全店舗の申請状況と確認事項')+`<div class="stats"><div class="stat">承認待ち<strong>${pending.length}件</strong></div><div class="stat">要確認の勤務<strong>${issues.length}件</strong></div><div class="stat">${me.role==='manager'?'勤務中':'確定済み店舗'}<strong>${me.role==='manager'?D.shifts.filter(s=>!s.end&&!s.cancelled).length:D.monthly.filter(x=>x.month===currentMonth()&&x.closed).length}${me.role==='manager'?'人':' / '+D.stores.length+'店'}</strong></div><div class="stat">${me.role==='manager'?'未確認の申請結果':'バックアップ'}<strong>${me.role==='manager'?D.requests.filter(r=>!r.seen&&r.status!=='申請中').length+'件':last?(last.valid?'正常':'失敗'):'未実行'}</strong></div></div><div class="grid"><section class="panel"><h2>対応が必要な申請</h2>${requestsTable(pending.slice(0,6))}</section><section class="panel"><h2>お知らせ</h2><p>要確認の勤務が ${issues.length} 件あります。</p><p>承認待ちの申請が ${pending.length} 件あります。</p>${last?`<p>${esc(last.kind)}：${esc(local(last.created))} ${last.valid?'成功':'失敗'}</p>`:''}<p class="muted">打刻ミスは本人から店舗責任者へ報告し、修正申請してください。</p></section></div>`;return}
+
+if(path==='attendance'){m.innerHTML=page('勤怠確認','1回の出勤から退勤までを1行で表示します。',btn(me.role==='manager'?'勤務の追加申請':'勤務を追加','new-correction','primary'))+filters()+`<div id="filtered">${shiftsTable(D.shifts)}</div>`;return}
+
+if(path==='requests'||path.startsWith('approval')){let kind=path.split('/')[1],reqs=kind?D.requests.filter(r=>kind==='register'?['register','rehire'].includes(r.kind):kind==='correction'?['correction','cancel'].includes(r.kind):r.kind===kind):D.requests;m.innerHTML=page(path==='requests'?'申請一覧':'申請承認',kind?(D.kinds[kind]||kind):'申請の状態と履歴を確認できます。')+requestsTable(reqs);return}
+
+if(path.startsWith('employee/')){requestForm(path.split('/')[1]);return}
+
+if(path==='people'){m.innerHTML=page('従業員情報','写真の変更や所属変更は申請・承認を経て反映します。')+table(['従業員番号','氏名','所属店舗','状態'],D.employees.map(e=>`<tr><td>${esc(e.id)}</td><td>${esc(e.name)}</td><td>${esc(storeName(e.current_store_id))}</td><td>${tag(e.active?'利用中':'停止中')}</td></tr>`));return}
+
+if(path==='stores'){m.innerHTML=page('店舗情報','停止後も過去の記録は保持されます。',me.role==='admin'?btn('店舗を追加','store-add','primary'):'')+table(['店舗','状態','操作'],D.stores.map(s=>`<tr><td>${esc(s.name)}</td><td>${tag(s.active?'利用中':'停止中')}</td><td>${me.role==='admin'?btn(s.active?'利用停止':'再開','store-active','',`data-id="${s.id}" data-active="${s.active?0:1}"`):'―'}</td></tr>`));return}
+
+if(path==='helpers'){m.innerHTML=page('応援勤務一覧')+table(['従業員','応援先','応援日'],D.helpers.map(h=>`<tr><td>${esc(h.employee_id)}</td><td>${esc(storeName(h.store_id))}</td><td>${esc(h.day)}</td></tr>`));return}
+
+if(path==='notices'){m.innerHTML=page('業務連絡','確認人数を選択すると、配信対象者全員の確認状況を表示します。',btn('新しい連絡','notice-new','primary'))+table(['件名','掲載開始','掲載終了','確認状況','状態','操作'],D.notices.map(n=>`<tr><td class="wrap">${esc(n.title)}</td><td>${local(n.start)}</td><td>${local(n.end)}</td><td>${btn(`確認済み ${n.confirmed}/${n.total}人`,'notice-readers','link-button',`data-id="${n.id}"`)}</td><td>${tag(n.withdrawn?'取り下げ':'掲載設定中')}</td><td>${btn('編集・宛先追加','notice-edit','',`data-id="${n.id}"`)} ${!n.withdrawn?btn('取り下げ','notice-withdraw','danger',`data-id="${n.id}"`):''}</td></tr>`));return}
+
+if(path==='notice-new'){noticeForm();return}
+
+if(['monthly','carry'].includes(path)){m.innerHTML=page(path==='carry'?'繰越調整':'月次集計','実際の勤務と、過去月の修正・繰越調整を分けて表示します。')+`<form id="month-filter" class="panel filters"><input type="month" name="month" value="${currentMonth()}" required style="width:190px"><select name="store" style="width:200px"><option value="">全店舗</option>${storeOptions()}</select><button type="submit" class="primary">表示</button>${btn('CSV 4種ZIP出力','export')}${btn('この店舗・月を確定','close-month')}${btn('確定を解除','unlock-month')}</form><div id="month-result"></div>`;await loadMonth();return}
+
+if(path==='annual'){m.innerHTML=page('年度完了','全店舗・全対象月が確定し、未処理の勤怠がない場合に完了できます。')+`<form id="annual-form" class="panel"><label>対象年</label><input name="year" type="number" min="2020" max="2100" value="${new Date().getFullYear()-1}"><button class="primary" type="submit">年度完了を確認・確定</button></form>`+table(['年度','完了状態','処理日時'],D.annual.map(a=>`<tr><td>${a.year}</td><td>${tag(a.completed?'完了':'未完了')}</td><td>${local(a.updated)}</td></tr>`));return}
+
+if(path==='settings'){passwordPage();return}
+
+if(path==='users'){if(me.role!=='admin')throw new Error('管理責任者の権限が必要です。');m.innerHTML=page('アカウント管理','仮パスワードは本人が次回ログイン時に変更します。',btn('アカウント追加','user-add','primary'))+table(['個人ID','氏名','権限','担当店舗','状態','操作'],D.users.map(u=>`<tr><td>${esc(u.username)}</td><td>${esc(u.name)}</td><td>${esc(u.role)}</td><td>${esc(JSON.parse(u.stores).map(storeName).join('・'))}</td><td>${tag(u.active?'利用中':'停止中')}</td><td>${btn('設定・仮パスワード','user-edit','',`data-id="${u.id}"`)}</td></tr>`));return}
+
+if(path==='store-password'){m.innerHTML=page('店舗共通パスワード','更新すると全店舗のログインが無効になります。')+`<form id="shared-form" class="panel narrow"><label>新しい共通パスワード</label><input type="password" name="password" minlength="6" required><button class="primary">全店舗のパスワードを更新</button></form>`;return}
+
+if(path==='system'){m.innerHTML=page('システム設定')+`<form id="system-form" class="panel"><label>バックアップ保存先（サーバー上の専用フォルダ）</label><input name="backup_root" value="${esc(D.settings.backup_root)}" required><label>複数人判定の顔面積比</label><input name="face_ratio" type="number" min="0.01" max="1" step="0.01" value="${D.settings.face_ratio||.8}"><button class="primary">保存</button></form>`;return}
+
+if(path==='backups'){m.innerHTML=page('バックアップ・復元','CSVは毎日3時・30日保持。SQLiteは月次出力時に作成します。',btn('日次CSVを再実行','backup-csv','primary')+btn('SQLiteを作成','backup-sqlite'))+table(['種類','対象月','作成日時','結果','詳細','操作'],D.backups.map(b=>`<tr><td>${esc(b.kind)}</td><td>${esc(b.month)}</td><td>${local(b.created)}</td><td>${tag(b.valid?'成功':'失敗')}</td><td class="wrap">${esc(b.detail)}</td><td>${me.role==='admin'&&b.kind==='sqlite'&&b.valid?btn('この時点へ復元','restore','danger',`data-id="${b.id}"`):'―'}</td></tr>`));return}
+
+m.innerHTML=page('ページが見つかりません');}
+
+function storeOptions(){return D.stores.map(s=>`<option value="${s.id}">${esc(s.name)}</option>`).join('')}
+
+function filters(){return `<div class="panel filters"><select id="filter-store" style="width:200px"><option value="">全担当店舗</option>${storeOptions()}</select><input id="filter-name" placeholder="氏名・従業員番号で絞り込み" style="max-width:300px"><input id="filter-date" type="date" style="width:190px"></div>`}
+
+function shiftsTable(rows){return table(['氏名・番号','勤務店舗','出勤','退勤','実働時間','総勤務時間','状態'],rows.map(s=>`<tr data-click="shift" data-id="${s.id}"><td>${esc(s.name)}<small> ${esc(s.employee_id)}</small></td><td>${esc(storeName(s.store_id))}</td><td>${local(s.start)}</td><td>${local(s.end)}</td><td>${fmt(s.actual_seconds)}</td><td>${fmt(s.gross_seconds)}</td><td>${tag(s.issue?'要確認':s.state)}</td></tr>`))}
+
+function requestsTable(rows){return table(['申請種別','店舗','従業員番号','申請者','更新日','状態'],rows.map(r=>`<tr data-click="request" data-id="${r.id}"><td>${esc(D.kinds[r.kind])}${!r.seen&&r.status!=='申請中'?' ●':''}</td><td>${esc(storeName(r.store_id))}</td><td>${esc(r.employee_id)}</td><td>${esc(r.author_name)}</td><td>${local(r.updated)}</td><td>${tag(r.status)}</td></tr>`))}
+
+async function requestDetail(id){let r=await api('request/'+id),p=JSON.parse(r.payload);modal('申請詳細',`<div class="grid"><section><h3>${esc(D.kinds[r.kind])}　${tag(r.status)}</h3><p>従業員番号：${esc(r.employee_id)}<br>申請者：${esc(r.author_name||r.author)}<br>店舗：${esc(storeName(r.store_id))}</p><label>申請理由</label><p>${esc(r.reason)}</p>${r.review_reason?`<div class="notice">差し戻し理由：${esc(r.review_reason)}</div>`:''}<h3>現在の記録</h3>${fieldSummary(r.shift||{})}</section><section><h3>申請内容（変更対象のみ）</h3>${fieldSummary(p)}<div class="photos">${Object.entries(r.photos).map(([k,v])=>`<div><small>${k==='normal'?'正面・マスクなし':'正面・マスクあり'}</small><img src="data:image/jpeg;base64,${v}" alt="申請写真"></div>`).join('')}</div></section></div><div class="actions">${me.role!=='manager'&&r.status==='申請中'&&r.author!==me.user.id?btn('承認','approve','primary',`data-id="${id}"`)+btn('差し戻し','return','',`data-id="${id}"`):''}${r.author===me.user.id&&['申請中','差し戻し'].includes(r.status)?btn('編集して再申請','request-edit','primary',`data-id="${id}"`)+btn('申請を取り消す','request-cancel','danger',`data-id="${id}"`):''}</div><h3>申請履歴</h3>${table(['版','操作','日時'],r.history.map(h=>`<tr><td>${h.revision}</td><td>${esc(h.event)}</td><td>${local(h.created)}</td></tr>`))}`)}
+
+function requestForm(kind,shift=null,existing=null,person=null){enrollmentPhotos={};let payload=existing?JSON.parse(existing.payload):person?{name:person.name,kana:person.kana}:{},employee=existing?.employee_id||shift?.employee_id||person?.id||'';let correction=['correction','cancel'].includes(kind);let photos=['register','photo','rehire'].includes(kind);let target=$('#dialog-content');let html=`<form id="request-form" data-kind="${kind}" data-id="${existing?.id||''}" data-shift="${existing?.shift_id||shift?.id||''}"><div class="field-grid"><div><label>対象店舗</label><select name="store_id" required>${storeOptions()}</select></div><div><label>従業員番号</label><input name="employee_id" list="employees" value="${esc(employee)}" ${kind==='register'?'readonly placeholder="確定時に自動採番"':kind==='profile'?'readonly required':'required'}><datalist id="employees">${D.employees.map(e=>`<option value="${esc(e.id)}">${esc(e.name)}</option>`).join('')}</datalist></div></div>${['register','profile'].includes(kind)?`<label>氏名</label><input name="name" value="${esc(payload.name)}" required><label>読み仮名</label><input name="kana" value="${esc(payload.kana)}">`:''}${['transfer','help'].includes(kind)?`<label>${kind==='transfer'?'異動先':'応援先'}</label><select name="target_store">${storeOptions()}</select><label>${kind==='transfer'?'適用日':'応援日'}</label><input name="day" type="date" value="${esc(payload.day||'')}" required>`:''}${kind==='correction'?`<div class="notice">変更する項目にチェックしてください。チェックしていない項目は変更されません。</div><label><input type="checkbox" name="change_start" ${!shift||payload.start?'checked':''}>出勤日時を変更</label><input name="start" type="datetime-local" step="1" value="${dateInput(payload.start||shift?.start)}"><label><input type="checkbox" name="change_end" ${!shift||payload.end?'checked':''}>退勤日時を変更</label><input name="end" type="datetime-local" step="1" value="${dateInput(payload.end||shift?.end)}"><label><input type="checkbox" name="change_breaks" ${payload.breaks?'checked':''}>休憩記録を変更</label><div id="break-rows">${(payload.breaks||JSON.parse(shift?.breaks||'[]')).map(b=>breakRow(b)).join('')}</div>${btn('休憩を追加','break-add')}`:''}${kind==='cancel'?'<div class="notice error">元の打刻は履歴に残し、承認後に集計対象から外します。</div>':''}${photos?`<div class="notice">制服に帽子がある場合は、勤務時の服装で撮影してください。${existing?'既存の申請写真を維持する場合、写真の選び直しは不要です。':''}</div><div class="photos">${['normal','mask'].map((k,i)=>`<div><label>${i?'正面・マスクあり':'正面・マスクなし'}</label><input type="file" name="photo_${k}" accept="image/*" capture="user" ${existing?'':'required'}><div class="actions">${btn("カメラで撮影","photo-camera","",`data-kind="${k}"`)}</div><video id="enroll_${k}" autoplay muted playsinline class="hidden" style="height:220px"></video>${btn("この写真を使う","photo-shoot","hidden",`data-kind="${k}"`)}<img class="preview" id="preview_${k}" alt="選択した写真"></div>`).join('')}</div>`:''}<label>${isDirectKind(kind)?'変更・登録理由':'申請理由'}</label><textarea name="reason" required>${esc(existing?.reason||'')}</textarea><div class="actions"><button class="primary" type="submit">${isDirectKind(kind)?'内容を確認して保存':'内容を確認して申請'}</button></div></form>`;if(dialog.open){target.innerHTML=`<div class="page-head"><h2>${esc(D.kinds[kind])}</h2>${btn('閉じる','close')}</div>`+html}else{$('#main').innerHTML=page(D.kinds[kind]||'申請')+`<section class="panel">${html}</section>`}let form=$('#request-form');form.store_id.value=existing?.store_id||shift?.store_id||person?.current_store_id||D.stores[0]?.id||'';if(payload.target_store)form.target_store.value=payload.target_store;}
+
+function breakRow(b={}){return `<div class="field-grid break-row"><input aria-label="休憩開始" type="datetime-local" step="1" data-break="start" value="${b.start?dateInput(b.start):''}"><div class="actions"><input aria-label="休憩終了" type="datetime-local" step="1" data-break="end" value="${b.end?dateInput(b.end):''}" style="flex:1">${btn('削除','break-delete')}</div></div>`}
+
+async function imageData(file){if(!file)return null;let image=new Image();let u=URL.createObjectURL(file);try{image.src=u;await image.decode();let scale=Math.min(1,1600/image.width,1200/image.height),c=document.createElement('canvas');c.width=Math.round(image.width*scale);c.height=Math.round(image.height*scale);c.getContext('2d').drawImage(image,0,0,c.width,c.height);return c.toDataURL('image/jpeg',.92)}finally{URL.revokeObjectURL(u)}}
+
+function noticeForm(n=null){let stores=n?JSON.parse(n.store_ids):D.stores.map(s=>s.id),selected=new Set(n?.recipients.map(r=>r.employee_id)||[]);$('#main').innerHTML=page(n?'業務連絡の編集・宛先追加':'業務連絡の投稿','本文を編集しても確認済みの人へは再掲示しません。')+`<form id="notice-form" data-id="${n?.id||''}" class="panel"><label>件名</label><input name="title" value="${esc(n?.title||'')}" required><label>本文</label><textarea name="body" required>${esc(n?.body||'')}</textarea><div class="field-grid"><div><label>掲載開始</label><input name="start" type="datetime-local" step="1" value="${dateInput(n?.start)}" required></div><div><label>掲載終了</label><input name="end" type="datetime-local" step="1" value="${dateInput(n?.end||Date.now()+7*86400000)}" required></div></div><label>配信店舗</label><div class="actions">${D.stores.map(s=>`<label><input name="notice_store" type="checkbox" value="${s.id}" ${stores.includes(s.id)?'checked':''}>${esc(s.name)}</label>`).join('')}</div><label><input id="notice-all" type="checkbox">選択店舗の従業員全員を選択</label><div class="checklist" id="recipient-list">${D.employees.filter(e=>e.active).map(e=>`<label data-home="${e.current_store_id}"><input type="checkbox" name="recipient" value="${esc(e.id)}" ${selected.has(e.id)?'checked':''}>${esc(e.name)} <small>${esc(e.id)}</small></label>`).join('')}</div><div class="actions" style="margin-top:20px"><button type="submit" class="primary">内容を確認して${n?'更新':'送信'}</button></div></form>`;}
+
+async function loadMonth(){let f=$('#month-filter'),params=new URLSearchParams(new FormData(f));if(!params.get("store"))params.delete("store");let r=await api('monthly?'+params);window.monthReport=r;$('#month-result').innerHTML=table(['従業員','店舗','出勤日数','勤務回数','実働時間','総勤務時間','当月増減調整','調整後時間','前月繰越','翌月繰越','要確認／承認待ち','状態'],(r.employee_totals||r.rows).map(x=>`<tr data-click="month-detail" data-id="${esc(x.employee_id)}"><td>${esc(x.name)}<small> ${esc(x.employee_id)}</small></td><td>${esc(storeName(x.store_id))}</td><td>${x.days}日${x.special_days?`<br><small>うち${x.special_days}日 特別出勤</small>`:''}</td><td>${x.runs}回${x.special_runs?`<br><small>うち${x.special_runs}回 過去月分</small>`:''}</td><td>${fmt(x.actual_seconds)}</td><td>${fmt(x.gross_seconds)}</td><td>${fmt(x.adjustment_seconds)}</td><td>${fmt(x.adjusted_seconds)}</td><td>${fmt(x.carry_in)}</td><td>${fmt(x.carry_out)}</td><td>${x.issues}／${x.pending}</td><td>${tag(x.closed?'確定済み':'未確定')}</td></tr>`));}
+
+function passwordPage(force=false){$('#main').innerHTML=page(force?'仮パスワードの変更':'自分の設定','パスワードは表示・ログ出力しません。')+`<div class="grid"><form id="password-form" class="panel"><label>現在のパスワード</label><input name="old" type="password" required autocomplete="current-password"><label>新しいパスワード（6文字以上）</label><input name="new" type="password" minlength="6" required autocomplete="new-password"><button type="submit" class="primary">パスワードを変更</button></form>${!force&&me.role!=='manager'?`<form id="timeout-form" class="panel"><label>自動ログアウトまでの分数</label><input type="number" name="minutes" min="0" max="1440" value="${me.user.timeout/60}"><p class="muted">0は自動ログアウトOFFです。アカウントごとに保存します。</p><button class="primary">保存</button></form>`:''}</div>`}
+
+function userForm(u=null){modal(u?'アカウント設定':'アカウント追加',`<form id="user-form" data-id="${u?.id||''}">${!u?'<label>個人ID</label><input name="username" required><label>氏名</label><input name="name" required>':''}<label>権限</label><select name="role"><option value="manager">店舗責任者</option><option value="hq">本社担当者</option><option value="admin">本社管理責任者</option></select><label>担当店舗（店舗責任者）</label><div class="checklist">${D.stores.map(s=>`<label><input type="checkbox" name="store" value="${s.id}" ${u&&JSON.parse(u.stores).includes(s.id)?'checked':''}>${esc(s.name)}</label>`).join('')}</div><label>仮パスワード${u?'（変更しない場合は空欄）':''}</label><input name="password" type="password" minlength="6" ${u?'':'required'}>${u?`<label><input type="checkbox" name="active" ${u.active?'checked':''}>利用可能</label>`:''}<button class="primary">保存</button></form>`);$('#user-form').role.value=u?.role||'manager'}
+
+document.addEventListener('click',async e=>{let cat=e.target.closest('[data-category]');if(cat){let key=cat.dataset.category;if(key==='home'){navTo('home');return}let old=$('.mega');if(old?.dataset.key===key){old.remove();return}old?.remove();let items=sections[key][1].filter(([r])=>me.role==='admin'||!['store-password','system','stores'].includes(r));let menu=document.createElement('div');menu.className='mega';menu.dataset.key=key;menu.innerHTML=`<h2>${esc(sections[key][0])}</h2><div class="mega-grid">${items.map(([r,t])=>`<button data-route="${r}">${esc(t)}<span>›</span></button>`).join('')}</div>`;$('#navigation').append(menu);return}let link=e.target.closest('[data-route]');if(link){navTo(link.dataset.route);return}let punch=e.target.closest('[data-punch]');if(punch){doPunch(punch.dataset.punch).catch(fail);return}let click=e.target.closest('[data-click]');if(click){if(click.dataset.click==='shift'){let s=D.shifts.find(s=>s.id===click.dataset.id);modal('勤務詳細',`<h2>${esc(s.name)} ${tag(s.state)}</h2><p>${esc(storeName(s.store_id))}</p><div class="grid"><div><label>出勤</label>${local(s.start)}<label>退勤</label>${local(s.end)}</div><div><label>実働</label>${fmt(s.actual_seconds)}<label>総勤務時間</label>${fmt(s.gross_seconds)}</div></div><h3>休憩</h3>${table(['開始','終了'],JSON.parse(s.breaks).map(b=>`<tr><td>${local(b.start)}</td><td>${local(b.end)}</td></tr>`))}<div class="actions">${btn(me.role==='manager'?'修正申請':'勤務を修正','shift-correct','primary',`data-id="${s.id}"`)}${btn('取り消し申請','shift-cancel','danger',`data-id="${s.id}"`)}</div><h3>修正履歴</h3>${requestsTable(D.requests.filter(r=>r.shift_id===s.id))}`)}if(click.dataset.click==='request')requestDetail(click.dataset.id).catch(fail);if(click.dataset.click==='month-detail'){let emp=click.dataset.id;modal('勤務・調整明細',shiftsTable(D.shifts.filter(s=>s.employee_id===emp))+adjustmentSummary(emp))}return}let b=e.target.closest('[data-action]');if(!b){if(!e.target.closest('nav'))$('.mega')?.remove();return}let a=b.dataset.action;try{if(a==='photo-camera'){if(!navigator.mediaDevices?.getUserMedia)throw new Error('撮影にはHTTPSが必要です。');let k=b.dataset.kind,video=$('#enroll_'+k),stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user'},audio:false});enrollmentStreams.push(stream);video.srcObject=stream;video.classList.remove('hidden');video.nextElementSibling.classList.remove('hidden');await video.play();return}if(a==='photo-shoot'){let k=b.dataset.kind,video=$('#enroll_'+k);if(!video.videoWidth)throw new Error('画像の準備ができていません。');let c=document.createElement('canvas');c.width=video.videoWidth;c.height=video.videoHeight;c.getContext('2d').drawImage(video,0,0);enrollmentPhotos[k]=c.toDataURL('image/jpeg',.9);let preview=$('#preview_'+k);preview.src=enrollmentPhotos[k];preview.style.display='block';video.srcObject.getTracks().forEach(t=>t.stop());video.classList.add('hidden');b.classList.add('hidden');document.querySelector('[name=photo_'+k+']').required=false;return}if(a==='close'){enrollmentStreams.forEach(s=>s.getTracks().forEach(t=>t.stop()));enrollmentStreams=[];dialog.close();return}if(a==='menu-toggle'){$('#navigation').classList.toggle('open');return}if(a==='choose-store'){sessionStorage.setItem('store-choice',b.dataset.id);login();return}if(a==='hq-login'){location.href='/hq';return}if(a==='store-login'){location.href='/store';return}if(a==='manager-login'){stopCamera();login('manager');return}if(a==='clock'){await boot();return}if(a==='logout'){await api('logout',{});await boot();return}if(a==='ack'){b.disabled=true;await api('ack',{request_id:currentReceipt.request_id,notice_id:Number(b.dataset.id)});clearTimeout(noticeTimer);let i=Number(b.dataset.index)+1;if(i<currentReceipt.notices.length)showNotice(i);else clock();return}if(a==='new-correction'){modal('勤務追加申請','');requestForm('correction');return}if(a==='shift-correct'||a==='shift-cancel'){requestForm(a==='shift-correct'?'correction':'cancel',D.shifts.find(s=>s.id===b.dataset.id));return}if(a==='request-edit'){let r=await api('request/'+b.dataset.id);requestForm(r.kind,r.shift,r);return}if(a==='request-cancel'){if(confirm('この申請を取り消しますか？')){await api(`request/${b.dataset.id}/cancel`,{});dialog.close();await render(route)}return}if(a==='approve'||a==='return'){let reason=a==='return'?prompt('差し戻し理由を入力してください。'):'';if(reason===null)return;if(a==='approve'&&!confirm('申請内容を承認して反映しますか？'))return;await api(`request/${b.dataset.id}/review`,{decision:a==='approve'?'承認':'差し戻し',reason});dialog.close();await render(route);toast('処理しました。');return}if(a==='notice-new'){navTo('notice-new');return}if(a==='notice-edit'){noticeForm(D.notices.find(n=>n.id==b.dataset.id));return}if(a==='notice-readers'){let n=D.notices.find(n=>n.id==b.dataset.id);modal(n.title+'：確認状況',table(['従業員番号','氏名','確認状況','確認日時'],n.recipients.map(r=>`<tr><td>${esc(r.employee_id)}</td><td>${esc(r.name)}</td><td>${tag(r.ack?'確認済み':'未確認')}</td><td>${local(r.ack)}</td></tr>`)));return}if(a==='notice-withdraw'){if(confirm('この業務連絡の掲載を取り下げますか？')){await api(`notice/${b.dataset.id}/withdraw`,{});await render('notices')}return}if(a==='break-add'){$('#break-rows').insertAdjacentHTML('beforeend',breakRow());return}if(a==='break-delete'){b.closest('.break-row').remove();return}if(['close-month','unlock-month','export'].includes(a)){let f=$('#month-filter'),v=Object.fromEntries(new FormData(f));if(a==='export'){let exportParams=new URLSearchParams(v);if(!v.store)exportParams.delete('store');let r=await fetch('/api/export?'+exportParams,{headers:PORTAL_HEADERS});if(!r.ok)throw new Error((await r.json()).error);let u=URL.createObjectURL(await r.blob()),link=document.createElement('a');link.href=u;link.download=`attendance_${v.month}.zip`;link.click();setTimeout(()=>URL.revokeObjectURL(u),1000)}else{if(!v.store)throw new Error('操作する店舗を選択してください。');if(confirm(a==='close-month'?'この店舗・月を確定しますか？':'確定を解除しますか？')){await api('monthly',{month:v.month,store_id:Number(v.store),closed:a==='close-month'});await loadMonth()}}return}if(a==='store-add'){let name=prompt('追加する店舗名');if(name){await api('store',{name});await render('stores')}return}if(a==='store-active'){await api('store',{id:Number(b.dataset.id),active:Number(b.dataset.active)});await render('stores');return}if(a==='user-add'){userForm();return}if(a==='user-edit'){userForm(D.users.find(u=>u.id==b.dataset.id));return}if(a==='backup-csv'||a==='backup-sqlite'){b.disabled=true;await api('backup',{kind:a==='backup-csv'?'csv':'sqlite'});await render('backups');toast('バックアップを保存しました。');return}if(a==='restore'){let confirmText=prompt('現在データを退避し、更新を停止してDB全体を復元します。実行する場合「復元する」と入力してください。');if(confirmText){await api('restore',{backup_id:b.dataset.id,confirm:confirmText});dialog.close();await boot();toast('復元しました。ログインし直してください。')}return}}catch(e){fail(e);b.disabled=false}});
+
+document.addEventListener('submit',async e=>{e.preventDefault();let f=e.target,v=Object.fromEntries(new FormData(f)),submitter=f.querySelector('[type=submit],button:not([type])');if(submitter)submitter.disabled=true;try{if(f.id==='login-form'){await api('login',{...v,mode:f.dataset.mode});await boot()}else if(f.id==='request-form'){let kind=f.dataset.kind,payload={};if(['register','profile'].includes(kind))payload={name:v.name,kana:v.kana||''};if(['transfer','help'].includes(kind))payload={target_store:Number(v.target_store),day:v.day};if(kind==='correction'){if(v.change_start)payload.start=iso(v.start);if(v.change_end)payload.end=iso(v.end);if(v.change_breaks)payload.breaks=[...f.querySelectorAll('.break-row')].map(r=>({start:iso(r.querySelector('[data-break=start]').value),end:iso(r.querySelector('[data-break=end]').value)}))}let images={};for(let k of ['normal','mask']){let file=f.querySelector(`[name=photo_${k}]`)?.files[0];if(enrollmentPhotos[k])images[k]=enrollmentPhotos[k];else if(file)images[k]=await imageData(file)}let body={id:f.dataset.id||undefined,kind,store_id:Number(v.store_id),employee_id:v.employee_id,shift_id:f.dataset.shift||null,reason:v.reason,payload};if(Object.keys(images).length)body.images=images;if(!confirm(isDirectKind(kind)?'入力内容を直接確定しますか？':'入力内容を確認しました。申請しますか？'))return;let result=await api('request',body);dialog.close();navTo(result.direct?(kind==='correction'?'attendance':'people'):'requests');toast(result.direct?'保存しました。':'申請しました。')}else if(f.id==='notice-form'){if(!confirm('選択した宛先へ投稿・更新しますか？'))return;await api('notice',{id:Number(f.dataset.id)||undefined,title:v.title,body:v.body,start:iso(v.start),end:iso(v.end),store_ids:[...f.querySelectorAll('[name=notice_store]:checked')].map(x=>Number(x.value)),recipients:[...f.querySelectorAll('[name=recipient]:checked')].map(x=>x.value)});navTo('notices');toast('保存しました。')}else if(f.id==='month-filter'){await loadMonth()}else if(f.id==='annual-form'){if(confirm(v.year+'年の年度完了を確定しますか？')){await api('annual',{year:Number(v.year)});await render('annual')}}else if(f.id==='password-form'){await api('password',v);await boot();toast('パスワードを変更しました。')}else if(f.id==='timeout-form'){await api('settings',{timeout:Math.round(Number(v.minutes)*60)});me=await api('me');toast('設定を保存しました。')}else if(f.id==='shared-form'){if(confirm('全店舗のログインが無効になります。更新しますか？')){await api('settings',{store_password:v.password});f.reset();toast('共通パスワードを更新しました。')}}else if(f.id==='system-form'){await api('settings',{backup_root:v.backup_root,face_ratio:Number(v.face_ratio)});toast('設定を保存しました。')}else if(f.id==='user-form'){await api('user',{...v,id:Number(f.dataset.id)||undefined,stores:[...f.querySelectorAll('[name=store]:checked')].map(x=>Number(x.value)),active:v.active?1:0});dialog.close();await render('users');toast('アカウントを保存しました。')}}catch(e){fail(e)}finally{if(submitter)submitter.disabled=false}});
+
+document.addEventListener('change',async e=>{let t=e.target;if(t.name?.startsWith('photo_')){delete enrollmentPhotos[t.name.slice(6)];try{let data=await imageData(t.files[0]),p=$('#preview_'+t.name.slice(6));if(data){p.src=data;p.style.display='block'}}catch(e){fail(e)}}if(t.id==='notice-all'){let stores=[...document.querySelectorAll('[name=notice_store]:checked')].map(x=>Number(x.value));document.querySelectorAll('[name=recipient]').forEach(c=>{let emp=D.employees.find(e=>e.id===c.value);let permitted=stores.includes(emp.current_store_id)||D.helpers.some(h=>h.employee_id===emp.id&&stores.includes(h.store_id));if(permitted)c.checked=t.checked})}if(t.closest('.filters')&&$('#filtered'))filterShifts()});
+
+document.addEventListener('input',e=>{if(e.target.id==='filter-name')filterShifts()});
+
+function filterShifts(){let name=$('#filter-name').value.toLowerCase(),store=$('#filter-store').value,date=$('#filter-date').value;$('#filtered').innerHTML=shiftsTable(D.shifts.filter(s=>(!store||s.store_id==store)&&(!date||s.start.startsWith(date))&&(s.name+' '+s.employee_id).toLowerCase().includes(name)))}
+
+document.addEventListener('pointerdown',()=>{if(me?.user&&Date.now()-activityAt>15000){activityAt=Date.now();api('activity',{}).catch(()=>{})}if(route==='notice'){clearTimeout(noticeTimer);noticeTimer=setTimeout(clock,30000)}});
+
+document.addEventListener('keydown',()=>{if(me?.user&&Date.now()-activityAt>15000){activityAt=Date.now();api('activity',{}).catch(()=>{})}});
+
+window.addEventListener('hashchange',()=>{if(me?.user)render(location.hash.slice(1)||'home').catch(fail)});
+
+setInterval(async()=>{if(!me?.user)return;try{await api('me')}catch(e){if(e.status===403){toast('ログインの有効期間が終了しました。');await api('logout',{});await boot()}}},15000);
+
+window.addEventListener('pagehide',stopCamera);
+
+
+
+let labelSequence=0;new MutationObserver(()=>{document.querySelectorAll('label:not([for])').forEach(label=>{let control=label.nextElementSibling;if(control?.matches('input:not([type=hidden]),select,textarea')){if(!control.id)control.id='field-'+(++labelSequence);label.htmlFor=control.id}})}).observe(document.querySelector('main'),{childList:true,subtree:true});new MutationObserver(()=>{dialog.querySelectorAll('label:not([for])').forEach(label=>{let control=label.nextElementSibling;if(control?.matches('input:not([type=hidden]),select,textarea')){if(!control.id)control.id='field-'+(++labelSequence);label.htmlFor=control.id}})}).observe(dialog,{childList:true,subtree:true});
+
+
+
+function fieldSummary(value){const labels={start:'出勤日時',end:'退勤日時',breaks:'休憩記録',name:'氏名',kana:'読み仮名',target_store:'異動先・応援先',day:'適用日・応援日',cancelled:'取り消し状態'};return table(['項目','内容'],Object.entries(value).filter(([k])=>labels[k]).map(([k,v])=>`<tr><td>${labels[k]}</td><td class="wrap">${k==='breaks'?(typeof v==='string'?JSON.parse(v):v).map(b=>esc(local(b.start))+' ～ '+esc(local(b.end))).join('<br>'):k==='start'||k==='end'?esc(local(v)):k==='target_store'?esc(storeName(v)):k==='cancelled'?(v?'取り消し済み':'有効'):esc(v)}</td></tr>`))}
+
+function adjustmentSummary(emp){let r=window.monthReport;return '<h3>計上の明細</h3>'+table(['勤務日','反映月','店舗','種別','時間増減','勤務回数増減'],r.ledger.filter(x=>x.employee_id===emp).map(x=>`<tr><td>${esc(x.work_day)}</td><td>${esc(x.month)}</td><td>${esc(storeName(x.store_id))}</td><td>${esc(x.source)}</td><td>${fmt(x.seconds)}</td><td>${x.runs}</td></tr>`))+'<h3>調整の適用</h3>'+table(['調整元の勤務月','調整元店舗','適用店舗','適用時間'],r.allocations.filter(x=>x.employee_id===emp).map(x=>`<tr><td>${esc(x.work_month)}</td><td>${esc(storeName(x.origin_store_id))}</td><td>${esc(storeName(x.store_id))}</td><td>${fmt(x.applied_seconds)}</td></tr>`))+'<h3>翌月への繰越残</h3>'+table(['調整元の勤務月','調整元店舗','残り時間'],(r.carry[emp]||[]).map(x=>`<tr><td>${esc(x.work_month)}</td><td>${esc(storeName(x.store_id))}</td><td>${fmt(x.seconds)}</td></tr>`))}
+
+
+function currentMonth(){return new Intl.DateTimeFormat('sv-SE',{timeZone:'Asia/Tokyo',year:'numeric',month:'2-digit'}).format(new Date())}

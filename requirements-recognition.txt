@@ -1,0 +1,5 @@
+numpy
+opencv-python
+insightface==0.7.3
+onnxruntime
+# Install torch CPU separately (see README).
