@@ -1,0 +1,47 @@
+# Virtual environments and Python caches
+.venv*/
+venv*/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+# Runtime records, images, biometric data and backups
+data/
+registered/
+uploads/
+backups/
+.update-backups/
+*.db
+*.db-*
+*.sqlite*
+*.csv
+*.log
+*.jsonl
+*.lock
+account-map.json
+# Credentials / private configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+# Downloaded model weights
+*.pth
+*.pt
+*.onnx
+*.safetensors
+# Local editors, builds and archives
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+dist/
+build/
+*.egg-info/
+*.zip
