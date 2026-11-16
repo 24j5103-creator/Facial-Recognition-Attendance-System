@@ -54,7 +54,7 @@ def ensure_open(db, store, month):
 
 def normal_rows(db):
     """Exclude corrected shifts from raw aggregation; postings retain their attribution."""
-    changed = {r[0] for r in db.execute("SELECT DISTINCT shift_id FROM requests WHERE status='承認済み' AND shift_id IS NOT NULL AND kind IN ('correction','cancel')")}
+    changed = {r[0] for r in db.execute("SELECT DISTINCT shift_id FROM requests WHERE status='承認済み' AND shift_id IS NOT NULL AND kind IN ('correction','cancel','restore')")}
     for row in db.execute("SELECT * FROM shifts ORDER BY start,id"):
         shift = dict(row)
         if shift["id"] in changed or shift["cancelled"] or not shift["end"] or issue(shift):

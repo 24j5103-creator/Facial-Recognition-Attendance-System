@@ -1,7 +1,7 @@
 'use strict';
 
-const roleLabel=r=>({employee:'一般従業員',manager:'店舗責任者',hq:'本社担当者',admin:'本社管理責任者'}[r]||r);
-function isDirectKind(kind){return me?.role!=='manager'&&['register','profile','correction'].includes(kind)}
+const roleLabel=r=>({employee:'一般従業員',manager:'店舗責任者',store_manager:'店舗責任者',department_manager:'部署責任者',area_manager:'エリア責任者',hq:'本社担当者',admin:'本社管理責任者'}[r]||r);
+function isDirectKind(kind){return high()&&['register','profile','correction'].includes(kind)}
 sections.employees[1].unshift(['people','従業員一覧']);
 sections.people[1].push(['employee/register','従業員を登録'],['plans','異動・応援予定']);
 sections.settings[1]=sections.settings[1].map(([r,t])=>[r,r==='users'?'権限保持者一覧':t]);
@@ -27,7 +27,7 @@ render=async function(path='home'){
         return;
     }
     await originalRender(path);
-    if(path==='home'&&me.role==='manager'){
+    if(path==='home'&&!['hq','admin'].includes(me.role)){
         $('#main .grid').insertAdjacentHTML('beforebegin','<section class="panel"><h2>勤務中・休憩中の従業員</h2><div id="working-now"></div></section>');
         paintWorking();
     }
@@ -35,7 +35,7 @@ render=async function(path='home'){
 
 function paintEmployees(query){
     query=query.trim().toLocaleLowerCase();
-    $('#employee-results').innerHTML=table(['従業員番号','氏名','所属店舗','状態','詳細'],D.employees.filter(e=>(e.id+' '+e.name).toLocaleLowerCase().includes(query)).map(e=>`<tr><td>${esc(e.id)}</td><td>${esc(e.name)}</td><td>${esc(storeName(e.current_store_id))}</td><td>${tag(e.active?'利用中':'停止中')}</td><td>${btn('詳細・編集','person-detail','',`data-id="${esc(e.id)}"`)}</td></tr>`));
+    $('#employee-results').innerHTML=table(['従業員番号','氏名','所属店舗','権限','状態','詳細'],D.employees.filter(e=>(e.id+' '+e.name).toLocaleLowerCase().includes(query)).map(e=>`<tr><td>${esc(e.id)}</td><td>${esc(e.name)}</td><td>${esc(storeName(e.current_store_id))}</td><td>${esc((e.roles?.length?e.roles:['employee']).map(roleLabel).join('・'))}</td><td>${tag(e.active?'利用中':'停止中')}</td><td>${btn('詳細・編集','person-detail','',`data-id="${esc(e.id)}"`)}</td></tr>`));
 }
 function paintWorking(){
     if(!$('#working-now'))return;
@@ -86,11 +86,11 @@ document.addEventListener('click',async e=>{
         }
         if(action==='working-detail'){D=await api('data');workingDetail(b.dataset.id);return}
         if(action==='plan-cancel'){
-            if(confirm('打刻前の応援予定を取り消しますか？')){await api(`plan/help/${b.dataset.id}`,{cancel:true});await render('plans')}
+            if(await ask('打刻前の応援予定を取り消しますか？')){await api(`plan/help/${b.dataset.id}`,{cancel:true});await render('plans')}
             return;
         }
         const p=(b.dataset.kind==='help'?D.helpers:D.transfers).find(x=>x.id==b.dataset.id);
-        modal('予定の変更',`<form id="plan-form" data-kind="${b.dataset.kind}" data-id="${p.id}"><label>従業員番号</label><p>${esc(p.employee_id)}</p><label>変更先店舗</label><select name="target_store">${storeOptions()}</select><label>日付</label><input name="day" type="date" value="${esc(p.day||p.effective)}" required><button type="submit" class="primary">内容を確認して保存</button></form>`);
+        modal('予定の変更',`<form id="plan-form" data-kind="${b.dataset.kind}" data-id="${p.id}"><label>従業員番号</label><p>${esc(p.employee_id)}</p><label>変更先店舗</label><select name="target_store">${destinationOptions(b.dataset.kind)}</select><label>日付</label><input name="day" type="date" value="${esc(p.day||p.effective)}" required><button type="submit" class="primary">内容を確認して保存</button></form>`);
         $('#plan-form').elements.target_store.value=p.store_id;
     }catch(error){fail(error)}
 },true);
@@ -98,7 +98,7 @@ document.addEventListener('submit',async e=>{
     const f=e.target;
     if(!['plan-form','user-form'].includes(f.id))return;
     e.preventDefault();e.stopImmediatePropagation();
-    if(!confirm('変更内容を確定しますか？'))return;
+    if(!await ask('変更内容を確定しますか？'))return;
     const button=f.querySelector('[type=submit]');button.disabled=true;
     try{
         const values=Object.fromEntries(new FormData(f));
@@ -108,7 +108,7 @@ document.addEventListener('submit',async e=>{
     }catch(error){fail(error)}finally{button.disabled=false}
 },true);
 setInterval(async()=>{
-    if(route!=='home'||me?.role!=='manager'||dialog.open)return;
+    if(route!=='home'||high()||dialog.open)return;
     try{D=await api('data');paintWorking()}catch{}
 },15000);
 boot().catch(e=>{$('#main').textContent='サーバーへ接続できません。起動状態を確認してください。';fail(e)});

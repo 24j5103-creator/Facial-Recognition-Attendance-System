@@ -1,8 +1,8 @@
-﻿$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
 if (-not (Test-Path -LiteralPath '.venv/Scripts/python.exe')) {
-    py -3.12 -m venv .venv
-    if ($LASTEXITCODE -ne 0) { py -3 -m venv .venv }
+    py -3.12 -m venv --system-site-packages .venv
+    if ($LASTEXITCODE -ne 0) { py -3 -m venv --system-site-packages .venv }
     if ($LASTEXITCODE -ne 0) { throw '仮想環境を作成できませんでした。Pythonのインストールを確認してください。' }
 }
 & ./.venv/Scripts/python.exe -m pip install -r requirements-web.txt

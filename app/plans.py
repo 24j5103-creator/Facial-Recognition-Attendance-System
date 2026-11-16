@@ -1,10 +1,12 @@
 import json
 from .db import now, parse
 from .requests import employee_store
+from .identity import headquarters,check_scope
+from .payroll import valid_day
 
 
 def change_plan(database, actor, kind, identifier, body):
-    if actor["role"] not in ("hq", "admin") or kind not in ("help", "transfer"):
+    if not (headquarters(actor) or actor["role"]=="area_manager") or kind not in ("help", "transfer"):
         raise PermissionError("本社権限が必要です。")
     with database.connect(write=True) as db:
         table = "helpers" if kind == "help" else "transfers"
@@ -12,13 +14,14 @@ def change_plan(database, actor, kind, identifier, body):
         if not row:
             raise ValueError("予定が見つかりません。")
         old = dict(row)
+        check_scope(actor,employee_store(db,old["employee_id"],now()[:10]))
         previous_day = old["day"] if kind == "help" else old["effective"]
         cancel = body.get("cancel") is True
         if cancel and kind != "help":
             raise ValueError("異動取り消しはこの操作の対象ではありません。")
         from datetime import date
-        new_day = previous_day if cancel else date.fromisoformat(body["day"]).isoformat()
-        if previous_day < now()[:10] or (not cancel and (previous_day <= now()[:10] or new_day <= now()[:10])):
+        new_day = previous_day if cancel else valid_day(body["day"]).isoformat()
+        if previous_day < now()[:10] or (not cancel and (new_day < now()[:10] or (kind=="transfer" and (previous_day<=now()[:10] or new_day<=now()[:10])))):
             raise ValueError("変更できるのは未来の予定だけです。")
         shifts = [dict(r) for r in db.execute("SELECT * FROM shifts WHERE employee_id=? AND cancelled=0", (old["employee_id"],))]
         for day in {previous_day, new_day}:

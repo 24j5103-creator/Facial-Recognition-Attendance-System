@@ -1,6 +1,5 @@
-Silent-Face-Anti-Spoofing
 https://github.com/minivision-ai/Silent-Face-Anti-Spoofing
-Reference commit: b6d5f04ad78778917853b25c778acef6d5626d15
-Retained helper code: src/model_lib/MiniFASNet.py; src/generate_patches.py
-License: Apache-2.0 (see LICENSE in this directory).
-The trained weights are not included. See README.md in this directory.
+Commit: b6d5f04ad78778917853b25c778acef6d5626d15
+
+YuNet: https://github.com/opencv/opencv_zoo
+Commit: 48b10fa505aeb51fbd127fc60a5c660040e823b7

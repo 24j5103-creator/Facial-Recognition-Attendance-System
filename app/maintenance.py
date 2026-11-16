@@ -41,13 +41,10 @@ def csv_bytes(rows, columns):
 def export_zip(database, month, store=None):
     with database.connect() as db:
         report = monthly_report(db, month, store)
-        summary = []
-        for row in report["employee_totals"]:
-            r = dict(row)
-            r["確定状態"] = "確定済み" if r["closed"] else "未確定"
-            for k in ("gross_seconds", "actual_seconds", "adjustment_seconds", "adjusted_seconds", "carry_in", "carry_out", "special_seconds"):
-                r[k + "_表示"] = hms(r[k])
-            summary.append(r)
+        from .payroll import summarize, METRICS
+        summary=summarize(db,month,store)
+        for r in summary:
+            for key in METRICS[2:]: r[key]=hms(r[key])
         # Include origin shifts used by adjustments, not just current calendar month.
         shifts = []
         for row in db.execute("SELECT s.*,e.name FROM shifts s JOIN employees e ON s.employee_id=e.id ORDER BY s.start"):
@@ -67,7 +64,7 @@ def export_zip(database, month, store=None):
             for debt in debts:
                 if store is None or debt["store_id"] == store:
                     detail.append({**debt, "employee_id": emp, "month": month, "type": "翌月繰越残"})
-    groups = [("月次集計.csv", summary, ["employee_id", "name", "store_id", "home_store_id", "month", "days", "special_days", "runs", "special_runs", "actual_seconds", "actual_seconds_表示", "gross_seconds", "gross_seconds_表示", "adjustment_seconds", "adjustment_seconds_表示", "adjusted_seconds", "adjusted_seconds_表示", "carry_in", "carry_out", "carry_out_表示", "special_seconds", "special_seconds_表示", "issues", "pending", "確定状態"]),
+    groups = [("月次集計.csv",summary,['employee_id','name','store_id','month']+METRICS+['確定状態']),
               ("打刻明細.csv", shifts, ["id", "employee_id", "name", "store_id", "start", "end", "breaks", "cancelled", "version", "打刻操作履歴"]),
               ("修正履歴.csv", history, ["id", "request_id", "revision", "store_id", "employee_id", "shift_id", "actor", "event", "payload", "created"]),
               ("繰越明細.csv", detail, ["type", "employee_id", "store_id", "origin_store_id", "month", "work_month", "work_day", "request_id", "source", "approved", "seconds", "gross", "days", "runs", "special", "applied_seconds"])]
@@ -91,8 +88,8 @@ class Maintenance:
 
     def record(self, kind, path, month, valid, detail=""):
         with self.db.connect(write=True) as db:
-            if kind == "sqlite" and valid:
-                db.execute("UPDATE backups SET valid=0,detail='同対象月の最新版へ置換済み' WHERE kind='sqlite' AND path=? AND valid=1", (str(path),))
+            if valid:
+                db.execute("UPDATE backups SET valid=0,detail='同対象月の最新版へ置換済み' WHERE path=? AND valid=1", (str(path),))
             db.execute("INSERT INTO backups VALUES (?,?,?,?,?,?,?)", (str(uuid.uuid4()), kind, str(path), month, now(), int(valid), detail))
 
     def snapshot(self, month, folder=None, label=None):
@@ -122,6 +119,32 @@ class Maintenance:
                 raise
         finally:
             self.lock.release()
+
+    def manual(self, kind, month, actor):
+        from .payroll import valid_month
+        valid_month(month)
+        if kind not in ('sqlite','csv'): raise ValueError('バックアップ種別が不正です。')
+        try:
+            if kind=='sqlite':
+                path=self.snapshot(month)
+            else:
+                folder=self.root/'csv';folder.mkdir(parents=True,exist_ok=True)
+                path=folder/f'attendance_{month}_manual.zip'
+                temp=path.with_suffix('.tmp')
+                try:
+                    temp.write_bytes(export_zip(self.db,month))
+                    with zipfile.ZipFile(temp) as archive:
+                        if archive.testzip() or len(archive.namelist())!=4: raise ValueError('CSV検証に失敗しました。')
+                    os.replace(temp,path)
+                    self.record('csv',path,month,True)
+                finally: temp.unlink(missing_ok=True)
+            with self.db.connect(write=True) as db:
+                self.db.audit(db,actor,'手動バックアップ成功',str(path),after={'kind':kind,'month':month})
+        except Exception:
+            with self.db.connect(write=True) as db:
+                self.db.audit(db,actor,'手動バックアップ失敗',month,after={'kind':kind})
+            raise
+        return path
 
     def daily(self, at=None):
         at = at or datetime.now(JST)
@@ -177,6 +200,7 @@ class Maintenance:
             if delete:
                 path.unlink()
                 with self.db.connect(write=True) as db:
+                    db.execute("UPDATE backups SET valid=0,detail='保存期限経過のため削除済み' WHERE path=?",(str(path),))
                     self.db.audit(db, "system", "バックアップ期限削除", r["id"], {"path": str(path)})
 
     def restore(self, backup_id, actor):
@@ -194,8 +218,8 @@ class Maintenance:
             if src.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                 raise ValueError("バックアップの整合性を確認できません。")
             version = src.execute("SELECT value FROM settings WHERE key='identity_version'").fetchone()
-            if self.db.setting("identity_version") == 2 and (not version or json.loads(version[0]) != 2):
-                raise ValueError("番号統合前のバックアップです。旧版の環境で復元・移行してから利用してください。")
+            if not version or json.loads(version[0]) != 3:
+                raise ValueError("この更新版に対応しないバックアップです。旧版の環境で復元してください。")
             with self.db.connect(write=True) as db:
                 self.db.set(db, "maintenance", True)
             self.snapshot(datetime.now(JST).strftime("%Y-%m"), self.root / "pre_restore", f"before_{datetime.now(JST).strftime('%Y%m%d_%H%M%S')}.db")

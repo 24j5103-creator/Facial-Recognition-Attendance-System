@@ -7,7 +7,7 @@ const punch = source.slice(source.indexOf('async function doPunch(action)'), sou
 
 async function scenario({fresh=false, age=0, authenticated=true, rejectPunch=false}={}) {
     const calls=[];
-    const context={Date, Error, AUTH_VALID_MS:5000, crypto:{randomUUID:()=> 'request-id'},
+    const context={Date, Error, RECOVERY_KEY:"test-unresolved", AUTH_VALID_MS:5000, crypto:{randomUUID:()=> 'request-id'},
         face:fresh?{ticket:'recent-ticket'}:null, faceAt:Date.now()-age, punching:false,
         route:'clock', stream:{}, recognitionTask:Promise.resolve(), unresolved:null,
         updateFace(){}, $(){return {}}, capture:()=> 'new-frame',

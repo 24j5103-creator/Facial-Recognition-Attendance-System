@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 from pathlib import Path
 import secrets
 import sqlite3
@@ -17,6 +18,8 @@ def now():
 
 
 def parse(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(?::[0-9]{2}(?:\.[0-9]{1,6})?)?(?:Z|[+-][0-9]{2}:[0-9]{2})", value):
+        raise ValueError("日時は西暦4桁と月日時分・タイムゾーンを指定してください。")
     dt = datetime.fromisoformat(value)
     if dt.tzinfo is None:
         raise ValueError("日時にはタイムゾーンを含めてください。")
